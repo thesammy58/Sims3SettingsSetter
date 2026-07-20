@@ -76,6 +76,17 @@ class UISettings {
 
     void SetDisableHooks(bool disable);
 
+    // Disable Overlay Setting (headless mode) - skips the D3D9 hook and ImGui entirely, patches/settings still run
+    bool GetDisableOverlay() const {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_disableOverlay;
+    }
+
+    void SetDisableOverlay(bool disable);
+
+    // Reads just qol.ui.disable_overlay straight off the TOML. The D3D9 hook must be installed before the game creates its device, which is long before the full config load runs
+    bool PeekDisableOverlayEarly();
+
     // Font Scale
     float GetFontScale() const {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -92,11 +103,12 @@ class UISettings {
     static std::string GetKeyName(UINT vkCode);
 
   private:
-    UISettings() : m_uiToggleKey(VK_INSERT), m_disableHooks(false), m_fontScale(1.0f) {}
+    UISettings() : m_uiToggleKey(VK_INSERT), m_disableHooks(false), m_disableOverlay(false), m_fontScale(1.0f) {}
 
     mutable std::mutex m_mutex;
     UINT m_uiToggleKey;
     bool m_disableHooks;
+    bool m_disableOverlay;
     float m_fontScale;
 };
 
@@ -133,6 +145,9 @@ class BorderlessWindow {
     // TOML serialization (writes/reads qol.borderless_window section)
     void SaveToToml(toml::table& qolTable) const;
     void LoadFromToml(const toml::table& qolTable);
+
+    // Reads just qol.borderless_window.mode straight off the TOML, meeded before the full config load runs so dllmain can decide whether the D3D9 hook is required even with the overlay disabled
+    bool PeekEnabledEarly();
 
   private:
     BorderlessWindow() : m_mode(BorderlessMode::Disabled), m_hwnd(nullptr), m_originalStyle(0), m_originalExStyle(0), m_wasApplied(false) {}

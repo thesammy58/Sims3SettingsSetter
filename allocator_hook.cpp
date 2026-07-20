@@ -242,6 +242,9 @@ void InitializeAllocatorHooks() {
 
     LOG_INFO("Initializing Allocator Hooks (mimalloc via Detours)...");
 
+    // Set to 64 to save space on potential unfilled
+    mi_option_set(mi_option_arena_reserve, 64 * 1024);
+
     // Use LoadLibrary instead of GetModuleHandle - at DLL_PROCESS_ATTACH time, MSVCR80.dll may not be loaded yet...
     // MSVCR80 is the only CRT worth hooking: it's the game's (VC8) runtime and MSVCP80/operator new funnel into it, while the other loaded CRTs (msvcrt/ucrtbase/msvcp_win) are OS-side only. x
     HMODULE hMsvcr80 = LoadLibraryA("MSVCR80.dll");

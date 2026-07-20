@@ -6,6 +6,7 @@
 #include <mutex>
 #include <memory>
 #include <atomic>
+#include <cstring>
 #include "logger.h"
 #include "patch_settings.h"
 
@@ -42,6 +43,44 @@ class OptimizationPatch {
     // Debounced reinstall state to mitigate people crashing themselves :)
     std::chrono::steady_clock::time_point lastSettingChange;
     bool pendingReinstall = false;
+
+    struct MaintainedWrite {
+        uintptr_t address;
+        std::vector<BYTE> desiredBytes;
+    };
+    std::vector<MaintainedWrite> maintainedWrites;
+    std::mutex maintainedWritesMutex;
+
+    // Register (or replace) a value to keep asserted at address. Call after the initial write succeeds.
+    void AddMaintainedWrite(uintptr_t address, std::vector<BYTE> desiredBytes) {
+        if (!address || desiredBytes.empty()) return;
+        std::lock_guard<std::mutex> lk(maintainedWritesMutex);
+        for (auto& w : maintainedWrites) {
+            if (w.address == address) {
+                w.desiredBytes = std::move(desiredBytes);
+                return;
+            }
+        }
+        maintainedWrites.push_back({address, std::move(desiredBytes)});
+    }
+
+    // Stop maintaining all writes. Call at the START of Uninstall (before restoring originals) so a re-fire landing mid-uninstall can't re-stomp the value we're about to restore.
+    void ClearMaintainedWrites() {
+        std::lock_guard<std::mutex> lk(maintainedWritesMutex);
+        maintainedWrites.clear();
+    }
+
+    // Compare and write
+    static bool SafeReassert(uintptr_t address, const BYTE* data, size_t size) {
+        __try {
+            if (std::memcmp(reinterpret_cast<const void*>(address), data, size) == 0) { return true; } // untouched, nothing to do
+            DWORD oldProtect;
+            if (!VirtualProtect(reinterpret_cast<LPVOID>(address), size, PAGE_EXECUTE_READWRITE, &oldProtect)) { return false; }
+            std::memcpy(reinterpret_cast<void*>(address), data, size);
+            VirtualProtect(reinterpret_cast<LPVOID>(address), size, oldProtect, &oldProtect);
+            return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
 
     void MaybeSampleMinimal(LONG currentCalls);
 
@@ -128,6 +167,13 @@ class OptimizationPatch {
     void NotifySettingChanged() {
         lastSettingChange = std::chrono::steady_clock::now();
         pendingReinstall = true;
+    }
+
+    // Called when the game re-runs its settings/variable registration pass, which re-applies config values over any data we wrote ;_;
+    virtual void OnSettingsRefired() {
+        if (!isEnabled.load()) return;
+        std::lock_guard<std::mutex> lk(maintainedWritesMutex);
+        for (const auto& w : maintainedWrites) { SafeReassert(w.address, w.desiredBytes.data(), w.desiredBytes.size()); }
     }
 
     const std::string& GetName() const { return patchName; }
@@ -217,6 +263,9 @@ class OptimizationManager {
     void LoadFromToml(const toml::table& root);
 
     void EnsureEnabledByDefaultPatchesAreEnabled();
+
+    // Broadcast a settings re-fire to all enabled patches so they can re-assert config-backed data writes.
+    void OnSettingsRefired();
 
     // Unsaved changes tracking
     bool HasUnsavedChanges() const { return m_hasUnsavedChanges; }

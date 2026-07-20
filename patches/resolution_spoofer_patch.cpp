@@ -2,6 +2,7 @@
 #include "../patch_helpers.h"
 #include "../logger.h"
 #include "../qol.h"
+#include "../d3d9_hook.h"
 #include <d3d9.h>
 #include <vector>
 
@@ -97,25 +98,14 @@ class ResolutionSpooferPatch : public OptimizationPatch {
         HWND hTargetWindow = hFocusWindow;
         if (pPresentationParameters && pPresentationParameters->hDeviceWindow) { hTargetWindow = pPresentationParameters->hDeviceWindow; }
 
-        // Enforce windowed mode if Borderless Window is active
-        if (pPresentationParameters && BorderlessWindow::Get().IsEnabled()) {
-            if (!pPresentationParameters->Windowed) {
-                LOG_INFO("[ResolutionSpoofer] Enforcing Windowed Mode in CreateDevice (Borderless Enabled)");
-                pPresentationParameters->Windowed = TRUE;
-                pPresentationParameters->FullScreen_RefreshRateInHz = 0;
-
-                // Enforce DISCARD swap effect to allow backbuffer scaling
-                pPresentationParameters->SwapEffect = D3DSWAPEFFECT_DISCARD;
-
-                if (pPresentationParameters->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) { pPresentationParameters->Flags &= ~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER; }
-            }
-        }
+        // Enforce windowed mode if a borderless mode is configured
+        EnforceBorderlessWindowedParams(pPresentationParameters, "ResolutionSpoofer");
 
         HRESULT hr = originalCreateDevice(pThis, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
 
         // If successful and borderless is enabled, force the window update immediately
         // This defeats the game's attempt to resize the window to the backbuffer size (e.g 4K)a nd ensures it stays at monitor size (e.g 1080p) for downsampling.
-        if (SUCCEEDED(hr) && BorderlessWindow::Get().IsEnabled() && hTargetWindow) {
+        if (SUCCEEDED(hr) && BorderlessWindow::Get().GetMode() != BorderlessMode::Disabled && hTargetWindow) {
             LOG_INFO("[ResolutionSpoofer] Force-applying borderless window state after CreateDevice");
             BorderlessWindow::Get().SetWindowHandle(hTargetWindow);
             BorderlessWindow::Get().Apply();

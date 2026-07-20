@@ -33,10 +33,36 @@ ImGuiStyle g_baseStyle;
 EndScene_t original_EndScene = nullptr;
 Reset_t original_Reset = nullptr;
 WNDPROC original_WndProc = nullptr;
+typedef HRESULT(__stdcall* CreateDevice_t)(IDirect3D9*, UINT, D3DDEVTYPE, HWND, DWORD, D3DPRESENT_PARAMETERS*, IDirect3DDevice9**);
+static CreateDevice_t original_CreateDevice = nullptr;
+static std::atomic<bool> g_deviceHooksAttached(false);
+static void* g_hookedEndSceneAddr = nullptr;
 static std::atomic<bool> g_inEndScene(false);
-static std::atomic<bool> g_imguiInitializing(false);
+static std::atomic<bool> g_deviceInitializing(false);
+static std::atomic<bool> g_deviceInitDone(false);
 static std::atomic<bool> g_imguiInitialized(false);
+static bool g_overlayEnabled = true;
 HWND g_hookedWindow = nullptr;
+
+bool EnforceBorderlessWindowedParams(D3DPRESENT_PARAMETERS* pPresentationParameters, const char* logTag) {
+    if (!pPresentationParameters || pPresentationParameters->Windowed) { return false; }
+    if (BorderlessWindow::Get().GetMode() == BorderlessMode::Disabled) { return false; }
+
+    LOG_INFO(std::string("[") + logTag + "] Enforcing Windowed Mode for Borderless Window");
+    pPresentationParameters->Windowed = TRUE;
+    pPresentationParameters->FullScreen_RefreshRateInHz = 0; // need for windowed apparently
+
+    // Enforce DISCARD swap effect to allow backbuffer scaling (resolution spoofing)
+    // D3DSWAPEFFECT_COPY requires backbuffer size to match client area, which would fail here
+    pPresentationParameters->SwapEffect = D3DSWAPEFFECT_DISCARD;
+
+    // LOCKABLE_BACKBUFFER is incompatible with D3DSWAPEFFECT_DISCARD
+    if (pPresentationParameters->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) {
+        pPresentationParameters->Flags &= ~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
+        LOG_INFO(std::string("[") + logTag + "] Stripped LOCKABLE_BACKBUFFER flag");
+    }
+    return true;
+}
 
 HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
     if (!pDevice) { return original_EndScene(pDevice); }
@@ -50,20 +76,19 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
         return original_EndScene(pDevice);
     }
 
-    if (!g_imguiInitialized.load() && pDevice) {
+    if (!g_deviceInitDone.load()) {
         bool expected = false;
-        if (!g_imguiInitializing.compare_exchange_strong(expected, true)) {
+        if (!g_deviceInitializing.compare_exchange_strong(expected, true)) {
             g_inEndScene.store(false);
             return original_EndScene(pDevice);
         }
         g_pd3dDevice = pDevice;
-        LOG_INFO("[EndScene] Initializing ImGui context");
 
         // Get the correct window handle
         D3DDEVICE_CREATION_PARAMETERS params;
         if (FAILED(pDevice->GetCreationParameters(&params))) {
             LOG_ERROR("[EndScene] Failed to get device creation parameters");
-            g_imguiInitializing.store(false);
+            g_deviceInitializing.store(false);
             g_inEndScene.store(false);
             return original_EndScene(pDevice);
         }
@@ -79,7 +104,7 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
         }
         if (!gameWindow) {
             LOG_ERROR("[EndScene] No valid window handle found");
-            g_imguiInitializing.store(false);
+            g_deviceInitializing.store(false);
             g_inEndScene.store(false);
             return original_EndScene(pDevice);
         }
@@ -88,36 +113,45 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
         // Pass window handle to BorderlessWindow for borderless mode support
         BorderlessWindow::Get().SetWindowHandle(gameWindow);
 
-        // Initialize ImGui
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
-        ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+        if (g_overlayEnabled) {
+            LOG_INFO("[EndScene] Initializing ImGui context");
 
-        // Load default font at high resolution... Of course of course.. right, right, right......
-        ImFontConfig fontConfig;
-        fontConfig.SizePixels = 13.0f * FONT_OVERSAMPLE;
-        ImGui::GetIO().Fonts->AddFontDefault(&fontConfig);
+            // Initialize ImGui
+            IMGUI_CHECKVERSION();
+            ImGui::CreateContext();
+            ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+            ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+            ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
 
-        // Hook window procedure
-        SetLastError(0);
-        original_WndProc = (WNDPROC)SetWindowLongPtr(gameWindow, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
-        DWORD wndProcErr = GetLastError();
-        if (!original_WndProc && wndProcErr != ERROR_SUCCESS) {
-            char errBuf[128];
-            sprintf_s(errBuf, "[EndScene] SetWindowLongPtr failed. GetLastError=0x%08lX", (unsigned long)wndProcErr);
-            LOG_ERROR(errBuf);
+            // Load default font at high resolution... Of course of course.. right, right, right......
+            // This shouldn't be necessary w/ this version of ImGUI I think but I-
+            ImFontConfig fontConfig;
+            fontConfig.SizePixels = 13.0f * FONT_OVERSAMPLE;
+            ImGui::GetIO().Fonts->AddFontDefault(&fontConfig);
+
+            // Hook window procedure
+            SetLastError(0);
+            original_WndProc = (WNDPROC)SetWindowLongPtr(gameWindow, GWLP_WNDPROC, (LONG_PTR)HookedWndProc);
+            DWORD wndProcErr = GetLastError();
+            if (!original_WndProc && wndProcErr != ERROR_SUCCESS) {
+                char errBuf[128];
+                sprintf_s(errBuf, "[EndScene] SetWindowLongPtr failed. GetLastError=0x%08lX", (unsigned long)wndProcErr);
+                LOG_ERROR(errBuf);
+            }
+            WNDPROC current = (WNDPROC)GetWindowLongPtr(gameWindow, GWLP_WNDPROC);
+            if (current != HookedWndProc) { LOG_WARNING("[EndScene] WndProc hook verification failed"); }
+            LOG_INFO("[EndScene] Window procedure hooked successfully");
+
+            ImGui_ImplWin32_Init(gameWindow);
+            ImGui_ImplDX9_Init(pDevice);
+            g_imguiInitialized.store(true);
+            LOG_INFO("[EndScene] ImGui initialized");
+        } else {
+            LOG_INFO("[EndScene] Overlay disabled - skipping ImGui/WndProc, borderless window support only");
         }
-        WNDPROC current = (WNDPROC)GetWindowLongPtr(gameWindow, GWLP_WNDPROC);
-        if (current != HookedWndProc) { LOG_WARNING("[EndScene] WndProc hook verification failed"); }
-        LOG_INFO("[EndScene] Window procedure hooked successfully");
 
-        ImGui_ImplWin32_Init(gameWindow);
-        ImGui_ImplDX9_Init(pDevice);
-        g_imguiInitialized.store(true);
-        g_imguiInitializing.store(false);
-        LOG_INFO("[EndScene] ImGui initialized");
+        g_deviceInitDone.store(true);
+        g_deviceInitializing.store(false);
 
         // Initialize D3D9 hook registry for patches
         D3D9Hooks::Internal::Initialize(pDevice);
@@ -201,25 +235,9 @@ HRESULT __stdcall HookedEndScene(LPDIRECT3DDEVICE9 pDevice) {
 HRESULT __stdcall HookedReset(LPDIRECT3DDEVICE9 pDevice, D3DPRESENT_PARAMETERS* pPresentationParameters) {
     if (g_imguiInitialized.load()) { ImGui_ImplDX9_InvalidateDeviceObjects(); }
 
-    // Enforce windowed mode if Borderless Window is active
+    // Enforce windowed mode if a borderless mode is configured
     // This is critical when using the Resolution Spoofer patch with resolutions larger than the monitor, Exclusive Fullscreen fail/hangs the driver ):
-    if (pPresentationParameters && BorderlessWindow::Get().IsEnabled()) {
-        if (!pPresentationParameters->Windowed) {
-            LOG_INFO("[Reset] Enforcing Windowed Mode for Borderless Window");
-            pPresentationParameters->Windowed = TRUE;
-            pPresentationParameters->FullScreen_RefreshRateInHz = 0; // need for windowed apparently
-
-            // Enforce DISCARD swap effect to allow backbuffer scaling (resolution spoofing)
-            // D3DSWAPEFFECT_COPY requires backbuffer size to match client area, which would fail here
-            pPresentationParameters->SwapEffect = D3DSWAPEFFECT_DISCARD;
-
-            // LOCKABLE_BACKBUFFER is incompatible with D3DSWAPEFFECT_DISCARD
-            if (pPresentationParameters->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) {
-                pPresentationParameters->Flags &= ~D3DPRESENTFLAG_LOCKABLE_BACKBUFFER;
-                LOG_INFO("[Reset] Stripped LOCKABLE_BACKBUFFER flag");
-            }
-        }
-    }
+    EnforceBorderlessWindowedParams(pPresentationParameters, "Reset");
 
     HRESULT hr = original_Reset(pDevice, pPresentationParameters);
     if (FAILED(hr)) {
@@ -229,7 +247,7 @@ HRESULT __stdcall HookedReset(LPDIRECT3DDEVICE9 pDevice, D3DPRESENT_PARAMETERS* 
     }
 
     // Reapply borderless settings after Reset, reset usually resizes the window to the backbuffer size
-    if (SUCCEEDED(hr) && BorderlessWindow::Get().IsEnabled()) {
+    if (SUCCEEDED(hr) && BorderlessWindow::Get().GetMode() != BorderlessMode::Disabled) {
         // We don't have direct access to HWND here except via BorderlessWindow's stored handle or getting it from CreationParameters again, but BorderlessWindow should already have it
         // If pPresentationParameters has it, use it to make sure
         if (pPresentationParameters && pPresentationParameters->hDeviceWindow) { BorderlessWindow::Get().SetWindowHandle(pPresentationParameters->hDeviceWindow); }
@@ -327,8 +345,73 @@ LRESULT CALLBACK HookedWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lPara
     return CallWindowProc(original_WndProc, hWnd, uMsg, wParam, lParam);
 }
 
-bool InitializeD3D9Hook() {
-    LOG_INFO("[Init] Starting D3D9 hook initialization");
+// Attach EndScene/Reset detours using the vtable of the device the game actually created :)
+static void AttachDeviceHooks(IDirect3DDevice9* pDevice) {
+    void** vTable = *reinterpret_cast<void***>(pDevice);
+
+    bool expected = false;
+    if (!g_deviceHooksAttached.compare_exchange_strong(expected, true)) {
+        // Game made another device; if its vtable differs from the one we hooked something is very not good
+        if (g_hookedEndSceneAddr && g_hookedEndSceneAddr != vTable[42]) { LOG_WARNING("[CreateDevice] New device has a different EndScene, overlay may not render"); }
+        return;
+    }
+
+    g_hookedEndSceneAddr = vTable[42];
+    original_EndScene = reinterpret_cast<EndScene_t>(vTable[42]);
+    original_Reset = reinterpret_cast<Reset_t>(vTable[16]);
+
+    if (DetourTransactionBegin() != NO_ERROR) {
+        LOG_ERROR("[CreateDevice] DetourTransactionBegin failed");
+        original_EndScene = nullptr;
+        original_Reset = nullptr;
+        g_deviceHooksAttached.store(false); // Retry if the game creates another device
+        return;
+    }
+    if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR || DetourAttach(&(PVOID&)original_EndScene, HookedEndScene) != NO_ERROR || DetourAttach(&(PVOID&)original_Reset, HookedReset) != NO_ERROR ||
+        DetourTransactionCommit() != NO_ERROR) {
+
+        DetourTransactionAbort();
+        LOG_ERROR("[CreateDevice] Failed to attach EndScene/Reset hooks");
+        original_EndScene = nullptr;
+        original_Reset = nullptr;
+        g_deviceHooksAttached.store(false); // Retry if the game creates another device
+        return;
+    }
+
+    LOG_INFO("[CreateDevice] EndScene/Reset hooks attached from game device");
+}
+
+static HRESULT __stdcall HookedCreateDevice(
+    IDirect3D9* pD3D, UINT Adapter, D3DDEVTYPE DeviceType, HWND hFocusWindow, DWORD BehaviorFlags, D3DPRESENT_PARAMETERS* pPresentationParameters, IDirect3DDevice9** ppReturnedDeviceInterface) {
+    // Force windowed mode up front, exclusive fullscreen and borderless don't mix (broken alt-tab, style changes on an exclusive swapchain)
+    if (DeviceType == D3DDEVTYPE_HAL) { EnforceBorderlessWindowedParams(pPresentationParameters, "CreateDevice"); }
+
+    HRESULT hr = original_CreateDevice(pD3D, Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, ppReturnedDeviceInterface);
+    if (SUCCEEDED(hr) && ppReturnedDeviceInterface && *ppReturnedDeviceInterface) {
+        char buf[96];
+        sprintf_s(buf, "[CreateDevice] Device created (type=%d)", (int)DeviceType);
+        LOG_INFO(buf);
+        // Only latch onto HAL devices
+        if (DeviceType == D3DDEVTYPE_HAL) {
+            AttachDeviceHooks(*ppReturnedDeviceInterface);
+
+            // Hand the window over right away so borderless styles are in place before the game shows/sizes the window
+            if (BorderlessWindow::Get().GetMode() != BorderlessMode::Disabled) {
+                HWND hTargetWindow = hFocusWindow;
+                if (pPresentationParameters && pPresentationParameters->hDeviceWindow) { hTargetWindow = pPresentationParameters->hDeviceWindow; }
+                if (hTargetWindow) {
+                    BorderlessWindow::Get().SetWindowHandle(hTargetWindow);
+                    BorderlessWindow::Get().Apply();
+                }
+            }
+        }
+    }
+    return hr;
+}
+
+bool InitializeD3D9Hook(bool enableOverlay) {
+    g_overlayEnabled = enableOverlay;
+    LOG_INFO(enableOverlay ? "[Init] Starting D3D9 hook initialization" : "[Init] Starting D3D9 hook initialization (overlay disabled, borderless support only)");
 
     try {
         IDirect3D9* pD3D = Direct3DCreate9(D3D_SDK_VERSION);
@@ -337,68 +420,28 @@ bool InitializeD3D9Hook() {
             return false;
         }
 
-        LOG_INFO("[Init] Created D3D9 interface");
-
-        D3DPRESENT_PARAMETERS d3dpp = {};
-        d3dpp.Windowed = TRUE;
-        d3dpp.SwapEffect = D3DSWAPEFFECT_DISCARD;
-        // Create a minimal hidden window instead of relying on foreground window
-        WNDCLASS wc = {};
-        wc.lpfnWndProc = DefWindowProc;
-        wc.hInstance = GetModuleHandle(nullptr);
-        wc.lpszClassName = L"S3SS_DummyWndClass";
-        if (!RegisterClass(&wc)) {
-            DWORD regErr = GetLastError();
-            if (regErr != ERROR_CLASS_ALREADY_EXISTS) {
-                char errBuf[128];
-                sprintf_s(errBuf, "[Init] RegisterClass failed. GetLastError=0x%08lX", (unsigned long)regErr);
-                LOG_ERROR(errBuf);
-                pD3D->Release();
-                return false;
-            }
-        }
-        HWND dummyWnd = CreateWindowEx(0, wc.lpszClassName, L"S3SS Dummy", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr, wc.hInstance, nullptr);
-        d3dpp.hDeviceWindow = dummyWnd;
-
-        IDirect3DDevice9* pDevice = nullptr;
-        // NULLREF instead of HAL, one of the stupidest and hardest to track down bugs of my entire life...
-        // We only need the vtable (implemented by the d3d9 runtime, identical across device types), and a HAL device drags the whole GPU user-mode driver into the process just to be thrown away :D LOVE THAT YAAAAY
-        HRESULT hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, d3dpp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDevice);
-        if (FAILED(hr) || !pDevice) {
-            // Some setups might reject NULLREF so fall back to HAL rather than losing the overlay entirely
-            LOG_WARNING("[Init] NULLREF device creation failed, falling back to HAL");
-            hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, d3dpp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDevice);
-        }
-
-        if (FAILED(hr) || !pDevice) {
-            char errBuf[128];
-            sprintf_s(errBuf, "[Init] Failed to create D3D device. hr=0x%08lX", (unsigned long)hr);
-            LOG_ERROR(errBuf);
-            if (dummyWnd) DestroyWindow(dummyWnd);
-            pD3D->Release();
-            return false;
-        }
-
-        LOG_INFO("[Init] Created D3D device");
-
-        void** vTable = *reinterpret_cast<void***>(pDevice);
-        original_EndScene = reinterpret_cast<EndScene_t>(vTable[42]);
-        original_Reset = reinterpret_cast<Reset_t>(vTable[16]);
-
-        pDevice->Release();
+        // Hook IDirect3D9::CreateDevice (vtable slot 16) and pull EndScene/Reset from the device the game actually creates instead of a dummy device.
+        // No dummy device also means no HAL device dragging the whole GPU user-mode driver into the process just to be thrown away :D yay Iyipee
+        // Requires us to be installed before the game creates its device, hopefully guaranteed
+        void** vTable = *reinterpret_cast<void***>(pD3D);
+        original_CreateDevice = reinterpret_cast<CreateDevice_t>(vTable[16]);
         pD3D->Release();
-        if (dummyWnd) DestroyWindow(dummyWnd);
 
         LOG_DEBUG("[Init] Starting Detours transaction");
 
-        if (DetourTransactionBegin() != NO_ERROR || DetourUpdateThread(GetCurrentThread()) != NO_ERROR || DetourAttach(&(PVOID&)original_EndScene, HookedEndScene) != NO_ERROR ||
-            DetourAttach(&(PVOID&)original_Reset, HookedReset) != NO_ERROR || DetourTransactionCommit() != NO_ERROR) {
-
-            LOG_ERROR("[Init] Failed to attach D3D hooks");
+        if (DetourTransactionBegin() != NO_ERROR) {
+            LOG_ERROR("[Init] DetourTransactionBegin failed");
+            original_CreateDevice = nullptr;
+            return false;
+        }
+        if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR || DetourAttach(&(PVOID&)original_CreateDevice, HookedCreateDevice) != NO_ERROR || DetourTransactionCommit() != NO_ERROR) {
+            DetourTransactionAbort();
+            LOG_ERROR("[Init] Failed to attach CreateDevice hook");
+            original_CreateDevice = nullptr;
             return false;
         }
 
-        LOG_INFO("[Init] D3D9 hook initialization completed successfully");
+        LOG_INFO("[Init] CreateDevice hook installed, waiting for game device");
         return true;
     } catch (const std::exception& e) {
         LOG_ERROR(std::string("[Init] Exception during D3D9 hook: ") + e.what());
@@ -419,10 +462,11 @@ void CleanupD3D9Hook() {
         SetWindowLongPtr(g_hookedWindow, GWLP_WNDPROC, (LONG_PTR)original_WndProc);
     }
 
-    if (original_EndScene || original_Reset) {
+    if (original_CreateDevice || original_EndScene || original_Reset) {
         LOG_INFO("[Cleanup] Detaching D3D hooks");
         DetourTransactionBegin();
         DetourUpdateThread(GetCurrentThread());
+        if (original_CreateDevice) DetourDetach(&(PVOID&)original_CreateDevice, HookedCreateDevice);
         if (original_EndScene) DetourDetach(&(PVOID&)original_EndScene, HookedEndScene);
         if (original_Reset) DetourDetach(&(PVOID&)original_Reset, HookedReset);
         DetourTransactionCommit();

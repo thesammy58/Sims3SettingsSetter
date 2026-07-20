@@ -3,6 +3,7 @@
 #include "logger.h"
 #include "settings.h"
 #include "config/config_store.h"
+#include "config/config_paths.h"
 #include <Psapi.h>
 #include <fstream>
 #include <sstream>
@@ -118,6 +119,27 @@ void UISettings::SetDisableHooks(bool disable) {
     ConfigStore::Get().SaveAll();
 }
 
+void UISettings::SetDisableOverlay(bool disable) {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_disableOverlay = disable;
+    }
+    ConfigStore::Get().SaveAll();
+}
+
+bool UISettings::PeekDisableOverlayEarly() {
+    try {
+        toml::table root = toml::parse_file(Utils::Utf8ToWide(ConfigPaths::GetConfigPath()));
+        bool disable = root["qol"]["ui"]["disable_overlay"].value_or(false);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_disableOverlay = disable;
+        return disable;
+    } catch (...) {
+        // Missing/unparseable config, the full load reports it properly later
+        return false;
+    }
+}
+
 void UISettings::SetFontScale(float scale) {
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -131,6 +153,7 @@ void UISettings::SaveToToml(toml::table& qolTable) const {
     toml::table uiTable;
     uiTable.insert("toggle_key", static_cast<int64_t>(m_uiToggleKey));
     uiTable.insert("disable_hooks", m_disableHooks);
+    uiTable.insert("disable_overlay", m_disableOverlay);
     uiTable.insert("font_scale", static_cast<double>(m_fontScale));
     qolTable.insert("ui", std::move(uiTable));
 }
@@ -142,6 +165,7 @@ void UISettings::LoadFromToml(const toml::table& qolTable) {
 
     m_uiToggleKey = static_cast<UINT>((*uiNode)["toggle_key"].value_or(int64_t(VK_INSERT)));
     m_disableHooks = (*uiNode)["disable_hooks"].value_or(false);
+    m_disableOverlay = (*uiNode)["disable_overlay"].value_or(false);
     m_fontScale = static_cast<float>((*uiNode)["font_scale"].value_or(1.0));
 }
 
@@ -153,6 +177,7 @@ void BorderlessWindow::SetWindowHandle(HWND hwnd) {
     // Store original window style and rect when we first get the handle
     if (hwnd && m_originalStyle == 0) {
         m_originalStyle = GetWindowLong(hwnd, GWL_STYLE);
+        m_originalExStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
         GetWindowRect(hwnd, &m_originalRect);
     }
 
@@ -338,6 +363,16 @@ void BorderlessWindow::SaveToToml(toml::table& qolTable) const {
     }
     bwTable.insert("mode", modeStr);
     qolTable.insert("borderless_window", std::move(bwTable));
+}
+
+bool BorderlessWindow::PeekEnabledEarly() {
+    try {
+        toml::table root = toml::parse_file(Utils::Utf8ToWide(ConfigPaths::GetConfigPath()));
+        if (auto qolNode = root["qol"].as_table()) { LoadFromToml(*qolNode); }
+    } catch (...) {
+        // Missing/unparseable config, the full load reports it properly later
+    }
+    return GetMode() != BorderlessMode::Disabled;
 }
 
 void BorderlessWindow::LoadFromToml(const toml::table& qolTable) {

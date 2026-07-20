@@ -143,6 +143,13 @@ class BradyBunchBegonePatch : public OptimizationPatch {
         }
         patchedLocations = tx.locations;
 
+        {
+            std::vector<BYTE> desired(sizeof(float) * 3);
+            std::memcpy(desired.data(), newRGB, sizeof(float) * 3);
+            AddMaintainedWrite(primaryAddr, desired);
+            AddMaintainedWrite(siblingAddr, desired);
+        }
+
         isEnabled = true;
         LOG_INFO("[BradyBunchBegone] Successfully installed");
         return true;
@@ -153,6 +160,7 @@ class BradyBunchBegonePatch : public OptimizationPatch {
         lastError.clear();
 
         LOG_INFO("[BradyBunchBegone] Uninstalling...");
+        ClearMaintainedWrites(); // stop re-asserting before we restore, so a re-fire can't re-stomp our values
         if (!PatchHelper::RestoreAll(patchedLocations)) return Fail("Failed to restore original bytes");
 
         isEnabled = false;

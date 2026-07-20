@@ -827,6 +827,16 @@ void RenderUI() {
                     }
 
                     if (ImGui::IsItemHovered()) { ImGui::SetTooltip("Click to change the key used to toggle this UI\nDefault: Insert\nChanges are saved automatically"); }
+
+                    ImGui::Separator();
+
+                    // Overlay kill-switch for people who don't want the huge overhead of ~3mb imgui...
+                    bool disableOverlay = UISettings::Get().GetDisableOverlay();
+                    if (ImGui::Checkbox("Disable Overlay (requires restart)", &disableOverlay)) { UISettings::Get().SetDisableOverlay(disableOverlay); }
+                    if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("Skips this entire UI on next launch - patches and settings still apply\nBorderless window mode keeps working (the D3D9 hook stays installed for it)\nTo re-enable, set "
+                                          "disable_overlay = false under [qol.ui] in S3SS.toml");
+                    }
                 }
 
                 ImGui::EndTabItem();

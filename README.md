@@ -1,4 +1,4 @@
-# Sims 3 Settings Setter v1.6.2
+# Sims 3 Settings Setter v1.6.3
 
 Performance patcher and setting editor for The Sims 3.
 
@@ -166,6 +166,9 @@ Settings are stored in `Documents\Electronic Arts\The Sims 3\S3SS\S3SS.toml` (or
 
 **I get crashes when I use specific patches?**
 - Send me your `S3SS_LOG.txt` and the latest `xcpt...txt` crash log from `Documents\Electronic Arts\The Sims 3`.
+
+**Crashes at startup/first render (e.g. with a wrapper/translation-layer d3d9.dll)?**
+- You can run S3SS headless: set `disable_overlay = true` under `[qol.ui]` in `S3SS.toml` (or tick "Disable Overlay" in the UI's Other/QoL tab if the UI works for you). This skips the ImGui UI entirely, patches and settings from the config still apply. The D3D9 hook is also skipped unless a borderless window mode is enabled (borderless works headless, but if you need the hook completely gone set `mode = "disabled"` under `[qol.borderless_window]` too). Set it back to `false` to get the UI back.
 
 **My settings keep resetting every time I restart the game?**
 - Settings are now saved to `Documents\Electronic Arts\The Sims 3\S3SS\S3SS.toml` which should hopefuly resolve this.

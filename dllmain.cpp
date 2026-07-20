@@ -183,6 +183,10 @@ class VariableRegistryHook : public SettingsHook {
                 std::string error;
                 if (!ConfigStore::Get().SaveDefaults(&error)) { LOG_ERROR("Failed to save default settings: " + error); }
             }
+
+            try {
+                OptimizationManager::Get().OnSettingsRefired();
+            } catch (...) { LOG_ERROR("Exception broadcasting settings re-fire"); }
         }
     }
 
@@ -518,27 +522,43 @@ DWORD WINAPI HookThread(LPVOID lpParameter) {
         }
         g_deferredTopologyLog.clear();
 
-        // 2. Detect game version from PE timestamp
+        // 2. Initialize D3D hooks ASAP, we  detour IDirect3D9::CreateDevice and grab EndScene/Reset from the game's real device, so we have to be installed before the game creates it.
+        // Borderless window mode needs the device hooks even with the overlay disabled, so only skip them entirely when both are off.
+        {
+            bool disableOverlay = UISettings::Get().PeekDisableOverlayEarly();
+            bool borderlessWanted = BorderlessWindow::Get().PeekEnabledEarly();
+            if (disableOverlay && !borderlessWanted) {
+                LOG_INFO("Overlay is DISABLED via disable_overlay setting - running headless, patches still apply");
+            } else {
+                if (disableOverlay) { LOG_INFO("Overlay is DISABLED but borderless window is enabled - hooking D3D9 without the UI"); }
+                if (!InitializeD3D9Hook(!disableOverlay)) {
+                    // Non-fatal: settings hooks and patches are still useful without the overlay
+                    LOG_ERROR("Failed to initialize D3D9 hook - continuing without overlay");
+                }
+            }
+        }
+
+        // 3. Detect game version from PE timestamp
         if (DetectGameVersion()) {
             LOG_INFO(std::format("Detected game version: {} [0x{:08X}]", GetGameVersionName(), g_exeTimeDateStamp));
         } else {
             LOG_WARNING(std::format("Unknown game version [0x{:08X}] - patches may not work correctly", g_exeTimeDateStamp));
         }
 
-        // 3. grab CPU features
+        // 4. grab CPU features
         const auto& cpuFeatures = CPUFeatures::Get();
         LOG_INFO("[Optimization] CPU Features - SSE4.1: " + std::string(cpuFeatures.hasSSE41 ? "Yes" : "No") + ", AVX2: " + (cpuFeatures.hasAVX2 ? "Yes" : "No") + ", FMA: " + (cpuFeatures.hasFMA ? "Yes" : "No"));
 
-        // 4. Migration check (old crusty INI ->  TOML)
+        // 5. Migration check (old crusty INI ->  TOML)
         Migration::CheckAndMigrate();
 
-        // 5. Initialize patches (register only, states loaded from TOML below)
+        // 6. Initialize patches (register only, states loaded from TOML below)
         try {
             auto& patchManager = OptimizationManager::Get();
             LOG_INFO("Patches registered successfully");
         } catch (const std::exception& e) { LOG_ERROR("Failed to initialize patch system: " + std::string(e.what())); }
 
-        // 6. Load all settings from TOML (settings, config values, QoL, patches)
+        // 7. Load all settings from TOML (settings, config values, QoL, patches)
         {
             std::string error;
             if (!ConfigStore::Get().LoadAll(&error)) {
@@ -548,7 +568,7 @@ DWORD WINAPI HookThread(LPVOID lpParameter) {
             }
         }
 
-        // 7. Initialize settings hooks
+        // 8. Initialize settings hooks
         try {
             bool disableHooks = UISettings::Get().GetDisableHooks();
 
@@ -560,12 +580,6 @@ DWORD WINAPI HookThread(LPVOID lpParameter) {
             }
         } catch (const std::exception& e) {
             LOG_ERROR("Failed to initialize settings hooks: " + std::string(e.what()));
-            return FALSE;
-        }
-
-        // 8. Initialize D3D hooks
-        if (!InitializeD3D9Hook()) {
-            LOG_ERROR("Failed to initialize D3D9 hook");
             return FALSE;
         }
 
@@ -759,6 +773,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
                 g_ThreadHandle = NULL;
                 g_ThreadId = 0;
             }
+
+            CleanupD3D9Hook();
 
             g_hookManager.Cleanup();
 

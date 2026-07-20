@@ -187,6 +187,16 @@ void OptimizationManager::RegisterPatch(std::unique_ptr<OptimizationPatch> patch
     LOG_DEBUG("[PatchSystem] Registered patch: " + patchName);
 }
 
+void OptimizationManager::OnSettingsRefired() {
+    for (const auto& patch : patches) {
+        if (patch && patch->IsEnabled()) {
+            try {
+                patch->OnSettingsRefired();
+            } catch (...) { LOG_ERROR("[PatchSystem] Exception during OnSettingsRefired for " + patch->GetName()); }
+        }
+    }
+}
+
 void OptimizationManager::EnsureEnabledByDefaultPatchesAreEnabled() {
     for (const auto& patch : patches) {
         if ((!patch->EnablementLoadedFromConfig() & !patch->IsEnabled()) && patch->IsEnabledByDefault()) { patch->Install(); }

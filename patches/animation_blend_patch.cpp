@@ -95,7 +95,7 @@ class AnimationBlendPatch : public OptimizationPatch {
   private:
     std::vector<PatchHelper::PatchLocation> patchedLocations;
 
-    float minDuration = 0.0f;
+    float minDuration = 0.266f;
     float maxDuration = 0.0f;
     bool forceBlendOut = false;
 
@@ -127,7 +127,7 @@ class AnimationBlendPatch : public OptimizationPatch {
 
   public:
     AnimationBlendPatch() : OptimizationPatch("AnimationBlendPatch", nullptr) {
-        RegisterFloatSetting(&minDuration, "minDuration", SettingUIType::InputBox, 0.0f, 0.0f, 10.0f,
+        RegisterFloatSetting(&minDuration, "minDuration", SettingUIType::InputBox, 0.266f, 0.0f, 10.0f,
             "Minimum blend duration in seconds. Positive durations shorter than this are clamped up.\n"
             "Lengthens very short blends so animations ease in instead of snapping into place.\n"
             "0 = no clamping. Recommended ~0.27 .");
