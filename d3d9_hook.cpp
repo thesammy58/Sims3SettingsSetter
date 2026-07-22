@@ -249,9 +249,12 @@ HRESULT __stdcall HookedReset(LPDIRECT3DDEVICE9 pDevice, D3DPRESENT_PARAMETERS* 
     // Reapply borderless settings after Reset, reset usually resizes the window to the backbuffer size
     if (SUCCEEDED(hr) && BorderlessWindow::Get().GetMode() != BorderlessMode::Disabled) {
         // We don't have direct access to HWND here except via BorderlessWindow's stored handle or getting it from CreationParameters again, but BorderlessWindow should already have it
-        // If pPresentationParameters has it, use it to make sure
-        if (pPresentationParameters && pPresentationParameters->hDeviceWindow) { BorderlessWindow::Get().SetWindowHandle(pPresentationParameters->hDeviceWindow); }
-        BorderlessWindow::Get().Apply();
+        // If pPresentationParameters has it, use it to make sure SetWindowHandle applies + re-arms the deferred reapply
+        if (pPresentationParameters && pPresentationParameters->hDeviceWindow) {
+            BorderlessWindow::Get().SetWindowHandle(pPresentationParameters->hDeviceWindow);
+        } else {
+            BorderlessWindow::Get().Apply();
+        }
     }
 
     if (SUCCEEDED(hr) && g_imguiInitialized.load()) { ImGui_ImplDX9_CreateDeviceObjects(); }
@@ -396,13 +399,11 @@ static HRESULT __stdcall HookedCreateDevice(
             AttachDeviceHooks(*ppReturnedDeviceInterface);
 
             // Hand the window over right away so borderless styles are in place before the game shows/sizes the window
+            // SetWindowHandle applies the active mode and arms the deferred reapply, my dog just a bug
             if (BorderlessWindow::Get().GetMode() != BorderlessMode::Disabled) {
                 HWND hTargetWindow = hFocusWindow;
                 if (pPresentationParameters && pPresentationParameters->hDeviceWindow) { hTargetWindow = pPresentationParameters->hDeviceWindow; }
-                if (hTargetWindow) {
-                    BorderlessWindow::Get().SetWindowHandle(hTargetWindow);
-                    BorderlessWindow::Get().Apply();
-                }
+                if (hTargetWindow) { BorderlessWindow::Get().SetWindowHandle(hTargetWindow); }
             }
         }
     }

@@ -107,8 +107,7 @@ class ResolutionSpooferPatch : public OptimizationPatch {
         // This defeats the game's attempt to resize the window to the backbuffer size (e.g 4K)a nd ensures it stays at monitor size (e.g 1080p) for downsampling.
         if (SUCCEEDED(hr) && BorderlessWindow::Get().GetMode() != BorderlessMode::Disabled && hTargetWindow) {
             LOG_INFO("[ResolutionSpoofer] Force-applying borderless window state after CreateDevice");
-            BorderlessWindow::Get().SetWindowHandle(hTargetWindow);
-            BorderlessWindow::Get().Apply();
+            BorderlessWindow::Get().SetWindowHandle(hTargetWindow); // applies + re-arms the deferred reapply
         }
 
         return hr;

@@ -172,17 +172,19 @@ void UISettings::LoadFromToml(const toml::table& qolTable) {
 // BorderlessWindow stuff, I could probably streamline this significantly
 void BorderlessWindow::SetWindowHandle(HWND hwnd) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    bool windowChanged = hwnd && hwnd != m_hwnd;
     m_hwnd = hwnd;
 
     // Store original window style and rect when we first get the handle
-    if (hwnd && m_originalStyle == 0) {
+    // Recapture when the game hands us a different window (e.g. second device), the old capture belongs to the old window
+    if (hwnd && (m_originalStyle == 0 || windowChanged)) {
         m_originalStyle = GetWindowLong(hwnd, GWL_STYLE);
         m_originalExStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
         GetWindowRect(hwnd, &m_originalRect);
     }
 
-    // Apply borderless if it was enabled before we had a window handle
-    if (m_mode != BorderlessMode::Disabled && !m_wasApplied) {
+    // Apply whenever a mode is active, not just on the first handoff. The game yoinks styles/size when it sets up or recreates the device, so each needs a fresh apply and a re-arm deferred reapply
+    if (m_mode != BorderlessMode::Disabled) {
         switch (m_mode) {
         case BorderlessMode::DecorationsOnly:
             ApplyDecorationsOnly();
