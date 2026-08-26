@@ -273,17 +273,29 @@ class ExpandedCrashLogs : public OptimizationPatch {
 
         void HookedEndOfExceptionReportSections() {
             WriteS3SSSectionsInCrashLog();
+            CallEndOfExceptionReportSectionsChain();
+        }
 
-            uintptr_t nextInChain;
+        void CallEndOfExceptionReportSectionsChain() {
+            // The guard covers the whole dispatch, not just the `unknown5` read. We run at the
+            // tail of the exception-report writer, after the game has dropped its own try-level
+            // to -1, and its handler still has the native minidump to write after we return. Thus
+            // anything escaping here costs the .dmp as well as the end of the log. Unpatched, a
+            // fault here is fatal in the same place anyway, which makes swallowing it strictly
+            // more diagnostics than dying. It can be narrowed to just the read if that trade ever
+            // stops being worth it.
+            __try {
+                uintptr_t nextInChain;
 
-            if (endOfExceptionReportSectionsChain == 0) {
-                nextInChain = this->vtable->unknown5;
-            } else {
-                nextInChain = endOfExceptionReportSectionsChain;
-            }
+                if (endOfExceptionReportSectionsChain == 0) {
+                    nextInChain = this->vtable->unknown5;
+                } else {
+                    nextInChain = endOfExceptionReportSectionsChain;
+                }
 
-            // I hate __thiscall and it hates me!
-            std::mem_fn(std::bit_cast<decltype(&CrashLogObject::HookedEndOfExceptionReportSections)>(nextInChain))(this);
+                // I hate __thiscall and it hates me!
+                std::mem_fn(std::bit_cast<decltype(&CrashLogObject::HookedEndOfExceptionReportSections)>(nextInChain))(this);
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
 
         void WriteS3SSSectionsInCrashLog() {
