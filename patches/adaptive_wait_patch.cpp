@@ -26,7 +26,16 @@ class AdaptiveWaitPatch : public OptimizationPatch {
     static std::atomic<float> g_lastSuccessRate;
     static std::atomic<DWORD> g_stableIntervals;
 
-    // Function pointers for the IAT hook
+    // Runtime gate. The detour stays installed for the life of the process (see Uninstall);
+    // this atomic is what actually turns the optimisation on and off.
+    static std::atomic<bool> g_active;
+    // Every call that reached the hook, eligible or not. g_totalCalls only counts calls that
+    // actually spun, so without this there is no way to tell "installed and busy" from
+    // "installed and never engaged".
+    static std::atomic<DWORD> g_interceptedCalls;
+    static bool s_detoursInstalled;
+
+    // Function pointers for the inline detour
     typedef DWORD(WINAPI* WaitForSingleObject_t)(HANDLE, DWORD);
     static WaitForSingleObject_t Original_WaitForSingleObject;
 
@@ -96,6 +105,12 @@ class AdaptiveWaitPatch : public OptimizationPatch {
     // Returns true if the wait was handled (successfully or not), false if we should fallback to the original function
     static bool TrySmartWait(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable, bool isEx, DWORD& outResult) {
 
+        // Disabled -> pass straight through to the real API. This detour is process-wide, so
+        // this line runs on every thread in the process and has to stay cheap.
+        if (!g_active.load(std::memory_order_relaxed)) return false;
+
+        g_interceptedCalls.fetch_add(1, std::memory_order_relaxed);
+
         // 00e661ae: Mono domain unload dead code path, don't think this is called but we check just in case, ya never kno...
         // Prevents syscall on invalid handle (fallback to WAIT_FAILED)
         if (hHandle == NULL || hHandle == INVALID_HANDLE_VALUE) {
@@ -113,7 +128,7 @@ class AdaptiveWaitPatch : public OptimizationPatch {
                 outResult = WAIT_TIMEOUT;
                 return true;
             }
-            // Fall through for alertable case - kernel must process APC queue
+            // Fall through for alertable case as kernel must process APC queue
         }
 
         // avoid:
@@ -143,7 +158,7 @@ class AdaptiveWaitPatch : public OptimizationPatch {
         DWORD loopCount = 0;
 
         while (true) {
-            // A). Kernel object state check (syscall required - no user-mode visibility)
+            // A). Kernel object state check (syscall required, no user-mode visibility)
             // CRITICAL: Force bAlertable=FALSE to prevent APC side-effects during spin
             DWORD result;
             if (isEx) {
@@ -181,7 +196,7 @@ class AdaptiveWaitPatch : public OptimizationPatch {
             if (pauseCycles < 12) pauseCycles++; // Cap at 2^12 = 4096
         }
 
-        // Spin budget exhausted - fallback to true kernel blocking
+        // Spin budget exhausted, fallback to true kernel blocking
         g_spinFailures.fetch_add(1, std::memory_order_relaxed);
         UpdateBudget();
         return false;
@@ -190,15 +205,17 @@ class AdaptiveWaitPatch : public OptimizationPatch {
     static DWORD WINAPI Hooked_WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds) {
         DWORD result;
         if (TrySmartWait(hHandle, dwMilliseconds, FALSE, false, result)) { return result; }
-        if (Original_WaitForSingleObject) return Original_WaitForSingleObject(hHandle, dwMilliseconds);
-        return WaitForSingleObject(hHandle, dwMilliseconds);
+        // NOTE: no "return WaitForSingleObject(...)" fallback any more; with an inline detour
+        // on the export that call would re-enter this hook and recurse forever. Install() fails
+        // if the trampoline was not resolved, so it is non-null by the time we get here.
+        return Original_WaitForSingleObject(hHandle, dwMilliseconds);
     }
 
     static DWORD WINAPI Hooked_WaitForSingleObjectEx(HANDLE hHandle, DWORD dwMilliseconds, BOOL bAlertable) {
         DWORD result;
         if (TrySmartWait(hHandle, dwMilliseconds, bAlertable, true, result)) { return result; }
-        if (Original_WaitForSingleObjectEx) return Original_WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable);
-        return WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable);
+        // Same reasoning as above; the direct-API fallback would recurse through our own detour.
+        return Original_WaitForSingleObjectEx(hHandle, dwMilliseconds, bAlertable);
     }
 
   public:
@@ -212,29 +229,60 @@ class AdaptiveWaitPatch : public OptimizationPatch {
         g_spinSuccesses.store(0);
         g_spinFailures.store(0);
         g_totalCalls.store(0);
+        g_interceptedCalls.store(0);
         g_lastSuccessRate.store(0.5f);
         g_stableIntervals.store(0);
 
         HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-        HMODULE hTS3 = GetModuleHandle(NULL);
-        if (!hKernel32 || !hTS3) return Fail("Failed to get module handles");
+        if (!hKernel32) return Fail("Failed to get kernel32 module handle");
 
-        Original_WaitForSingleObject = (WaitForSingleObject_t)GetProcAddress(hKernel32, "WaitForSingleObject");
-        Original_WaitForSingleObjectEx = (WaitForSingleObjectEx_t)GetProcAddress(hKernel32, "WaitForSingleObjectEx");
+        // Inline detour on the kernel32 export, not an IAT hook on the main module.
+        //
+        // Why: On EA App builds (1.69) TS3.exe is packed and import-stripped, so there is
+        // no kernel32 descriptor to walk and IAT hooking cannot work there at all.
+        // Detouring the export needs no import metadata and behaves the same on Steam 1.67
+        // and EA App 1.69. This also resulted in a non-descriptive error when trying to
+        // enable the patch.
+        //
+        // Bonus? this now also catches waits issued from inside other modules (the Mono
+        // runtime, MSVCR80, d3d9), which an IAT hook on the main module structurally could
+        // never see as each module has its own IAT. On 1.67 only 4 of 13 static
+        // WaitForSingleObject call sites in the main exe pass INFINITE, and all 5
+        // WaitForSingleObjectEx sites pass bAlertable=TRUE and were being declined outright,
+        // so the old reach was considerably narrower than it looked
+        if (!s_detoursInstalled) {
+            Original_WaitForSingleObject = (WaitForSingleObject_t)GetProcAddress(hKernel32, "WaitForSingleObject");
+            Original_WaitForSingleObjectEx = (WaitForSingleObjectEx_t)GetProcAddress(hKernel32, "WaitForSingleObjectEx");
 
-        if (!Original_WaitForSingleObject || !Original_WaitForSingleObjectEx) { return Fail("Failed to get original WaitForSingleObject addresses"); }
+            if (!Original_WaitForSingleObject || !Original_WaitForSingleObjectEx) { return Fail("Failed to resolve WaitForSingleObject/Ex in kernel32"); }
 
-        bool iat1 = PatchHelper::IATHookHelper::Hook(hTS3, "kernel32.dll", "WaitForSingleObject", (void*)Hooked_WaitForSingleObject, nullptr);
-        bool iat2 = PatchHelper::IATHookHelper::Hook(hTS3, "kernel32.dll", "WaitForSingleObjectEx", (void*)Hooked_WaitForSingleObjectEx, nullptr);
+            std::vector<DetourHelper::Hook> hooks = {{reinterpret_cast<void**>(&Original_WaitForSingleObject), reinterpret_cast<void*>(Hooked_WaitForSingleObject)},
+                {reinterpret_cast<void**>(&Original_WaitForSingleObjectEx), reinterpret_cast<void*>(Hooked_WaitForSingleObjectEx)}};
 
-        if (!iat1 && !iat2) { return Fail("Failed to install any IAT hooks for WaitForSingleObject"); }
+            if (!DetourHelper::InstallHooks(hooks)) { return Fail("Failed to install WaitForSingleObject/Ex detours"); }
 
+            s_detoursInstalled = true;
+            LOG_INFO("[AdaptiveWait] Detoured kernel32!WaitForSingleObject/Ex (process-wide)");
+        }
+
+        g_active.store(true, std::memory_order_release);
         isEnabled = true;
         return true;
     }
 
     bool Uninstall() override {
         if (!isEnabled) return true;
+
+        // Deliberately does not detach. WaitForSingleObject is entered by every thread in the
+        // process, and DetourHelper only calls DetourUpdateThread(GetCurrentThread()), so a
+        // detach here could rewrite the prologue out from under a thread already inside it.
+        // Clearing the gate makes the hook a pass-through on its very next entry, which is the
+        // safe way to switch this off. (The previous Uninstall did neither; it flipped
+        // isEnabled and left the hook fully live and still spinning.)
+        g_active.store(false, std::memory_order_release);
+
+        LOG_INFO("[AdaptiveWait] Disabled - intercepted " + std::to_string(g_interceptedCalls.load(std::memory_order_relaxed)) + " wait(s), engaged on " + std::to_string(g_totalCalls.load(std::memory_order_relaxed)));
+
         isEnabled = false;
         return true;
     }
@@ -254,6 +302,9 @@ std::atomic<DWORD> AdaptiveWaitPatch::g_spinFailures{0};
 std::atomic<DWORD> AdaptiveWaitPatch::g_totalCalls{0};
 std::atomic<float> AdaptiveWaitPatch::g_lastSuccessRate{0.5f};
 std::atomic<DWORD> AdaptiveWaitPatch::g_stableIntervals{0};
+std::atomic<bool> AdaptiveWaitPatch::g_active{false};
+std::atomic<DWORD> AdaptiveWaitPatch::g_interceptedCalls{0};
+bool AdaptiveWaitPatch::s_detoursInstalled = false;
 AdaptiveWaitPatch::WaitForSingleObject_t AdaptiveWaitPatch::Original_WaitForSingleObject = nullptr;
 AdaptiveWaitPatch::WaitForSingleObjectEx_t AdaptiveWaitPatch::Original_WaitForSingleObjectEx = nullptr;
 AdaptiveWaitPatch* AdaptiveWaitPatch::instance = nullptr;
@@ -262,5 +313,5 @@ REGISTER_PATCH(AdaptiveWaitPatch, {.displayName = "Adaptive Thread Waiting",
                                       .description = "Replaces standard thread sleeping with a hybrid spin-wait to reduce stutter on short locks.",
                                       .category = "Performance",
                                       .experimental = true,
-                                      .technicalDetails = {"Hooks WaitForSingleObject/Ex via IAT to intercept thread waits", "Spin budget adapts between 50-500us based on success rate",
+                                      .technicalDetails = {"Detours kernel32!WaitForSingleObject/Ex process-wide", "Spin budget adapts between 50-500us based on success rate",
                                           "Spends extra CPU time spinning to avoid 3-15ms thread sleep latency", "Lower frame time variance at the cost of slightly higher CPU usage"}})
