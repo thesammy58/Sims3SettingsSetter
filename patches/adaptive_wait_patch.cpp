@@ -33,6 +33,17 @@ class AdaptiveWaitPatch : public OptimizationPatch {
     // actually spun, so without this there is no way to tell "installed and busy" from
     // "installed and never engaged".
     static std::atomic<DWORD> g_interceptedCalls;
+    // Cumulative spin outcomes. The adaptive loop's g_spinSuccesses/g_spinFailures are
+    // exchange(0)'d every ADAPT_INTERVAL calls, so they steer the budget but can never answer
+    // "did the spinning pay off?". These three are never reset except by Install(), and they
+    // separate the outcome that justifies this patch from the two that don't:
+    //   g_spinWins      - signaled after at least one pause: a real kernel block avoided.
+    //   g_spinFreebies  - signaled on the very first 0ms poll, before any pausing. The plain
+    //                     blocking call would have returned just as fast; this is a wash.
+    //   g_spinLosses    - budget exhausted: we spun and then blocked anyway. Pure cost.
+    static std::atomic<DWORD> g_spinWins;
+    static std::atomic<DWORD> g_spinFreebies;
+    static std::atomic<DWORD> g_spinLosses;
     static bool s_detoursInstalled;
 
     // Function pointers for the inline detour
@@ -158,7 +169,7 @@ class AdaptiveWaitPatch : public OptimizationPatch {
         DWORD loopCount = 0;
 
         while (true) {
-            // A). Kernel object state check (syscall required, no user-mode visibility)
+            // A). Kernel object state check (syscall required - no user-mode visibility)
             // CRITICAL: Force bAlertable=FALSE to prevent APC side-effects during spin
             DWORD result;
             if (isEx) {
@@ -170,6 +181,13 @@ class AdaptiveWaitPatch : public OptimizationPatch {
             // B) Success - object signaled
             if (result != WAIT_TIMEOUT) {
                 g_spinSuccesses.fetch_add(1, std::memory_order_relaxed);
+                // loopCount is still 0 only on the very first poll, i.e. the object was already
+                // signaled when we were called and no pausing happened. Separate those out.
+                if (loopCount == 0) {
+                    g_spinFreebies.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    g_spinWins.fetch_add(1, std::memory_order_relaxed);
+                }
                 outResult = result;
                 UpdateBudget();
                 return true;
@@ -198,6 +216,7 @@ class AdaptiveWaitPatch : public OptimizationPatch {
 
         // Spin budget exhausted, fallback to true kernel blocking
         g_spinFailures.fetch_add(1, std::memory_order_relaxed);
+        g_spinLosses.fetch_add(1, std::memory_order_relaxed);
         UpdateBudget();
         return false;
     }
@@ -230,6 +249,9 @@ class AdaptiveWaitPatch : public OptimizationPatch {
         g_spinFailures.store(0);
         g_totalCalls.store(0);
         g_interceptedCalls.store(0);
+        g_spinWins.store(0);
+        g_spinFreebies.store(0);
+        g_spinLosses.store(0);
         g_lastSuccessRate.store(0.5f);
         g_stableIntervals.store(0);
 
@@ -244,7 +266,7 @@ class AdaptiveWaitPatch : public OptimizationPatch {
         // and EA App 1.69. This also resulted in a non-descriptive error when trying to
         // enable the patch.
         //
-        // Bonus? this now also catches waits issued from inside other modules (the Mono
+        // Bonus maybe? this now also catches waits issued from inside other modules (the Mono
         // runtime, MSVCR80, d3d9), which an IAT hook on the main module structurally could
         // never see as each module has its own IAT. On 1.67 only 4 of 13 static
         // WaitForSingleObject call sites in the main exe pass INFINITE, and all 5
@@ -279,9 +301,15 @@ class AdaptiveWaitPatch : public OptimizationPatch {
         // Clearing the gate makes the hook a pass-through on its very next entry, which is the
         // safe way to switch this off. (The previous Uninstall did neither; it flipped
         // isEnabled and left the hook fully live and still spinning.)
-        g_active.store(false, std::memory_order_release);
 
-        LOG_INFO("[AdaptiveWait] Disabled - intercepted " + std::to_string(g_interceptedCalls.load(std::memory_order_relaxed)) + " wait(s), engaged on " + std::to_string(g_totalCalls.load(std::memory_order_relaxed)));
+        // Report the outcome split, not just the engagement count. "Engaged" includes spins that
+        // burned their whole budget and blocked anyway, so engagement alone cannot say whether the
+        // patch helps. The final spin budget is a free second opinion: UpdateBudget() slams it to
+        // MIN_SPIN_US below a 30% success rate and grows it toward MAX_SPIN_US above 65%, so a
+        // budget still sitting at the floor means the spinning was mostly not paying off.
+        LOG_INFO("[AdaptiveWait] Disabled - intercepted " + std::to_string(g_interceptedCalls.load(std::memory_order_relaxed)) + " wait(s), engaged on " + std::to_string(g_totalCalls.load(std::memory_order_relaxed)) +
+                 " (blocks avoided: " + std::to_string(g_spinWins.load(std::memory_order_relaxed)) + ", already signaled: " + std::to_string(g_spinFreebies.load(std::memory_order_relaxed)) +
+                 ", spun then blocked: " + std::to_string(g_spinLosses.load(std::memory_order_relaxed)) + "), final spin budget " + std::to_string(g_spinBudgetUs.load(std::memory_order_relaxed)) + "us");
 
         isEnabled = false;
         return true;
@@ -304,6 +332,9 @@ std::atomic<float> AdaptiveWaitPatch::g_lastSuccessRate{0.5f};
 std::atomic<DWORD> AdaptiveWaitPatch::g_stableIntervals{0};
 std::atomic<bool> AdaptiveWaitPatch::g_active{false};
 std::atomic<DWORD> AdaptiveWaitPatch::g_interceptedCalls{0};
+std::atomic<DWORD> AdaptiveWaitPatch::g_spinWins{0};
+std::atomic<DWORD> AdaptiveWaitPatch::g_spinFreebies{0};
+std::atomic<DWORD> AdaptiveWaitPatch::g_spinLosses{0};
 bool AdaptiveWaitPatch::s_detoursInstalled = false;
 AdaptiveWaitPatch::WaitForSingleObject_t AdaptiveWaitPatch::Original_WaitForSingleObject = nullptr;
 AdaptiveWaitPatch::WaitForSingleObjectEx_t AdaptiveWaitPatch::Original_WaitForSingleObjectEx = nullptr;
